@@ -122,7 +122,7 @@ var testCases = []struct {
 
 func Test_AmbiguousAlphabet(t *testing.T) {
 	_, err := NewEncoding("01gh1")
-	expect(err.Error(), "Ambiguous alphabet.", t)
+	expect(err.Error(), "duplicate character found in alphabet", t)
 }
 
 func Test_Encode(t *testing.T) {
@@ -146,15 +146,15 @@ func Test_Decode(t *testing.T) {
 func Test_NonDecodable(t *testing.T) {
 	enc, _ := NewEncoding("123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz")
 	_, err := enc.Decode("invalid")
-	expect(err.Error(), "Non Base Character", t)
+	expect(err.Error(), "unexpected character found", t)
 	_, err = enc.Decode("c2F0b3NoaQo=")
-	expect(err.Error(), "Non Base Character", t)
+	expect(err.Error(), "unexpected character found", t)
 	_, err = enc.Decode(" 1111111111")
-	expect(err.Error(), "Non Base Character", t)
+	expect(err.Error(), "unexpected character found", t)
 	_, err = enc.Decode("1111111111 ")
-	expect(err.Error(), "Non Base Character", t)
+	expect(err.Error(), "unexpected character found", t)
 	_, err = enc.Decode(" \t\n\u000b\f\r skip \r\f\u000b\n\t a")
-	expect(err.Error(), "Non Base Character", t)
+	expect(err.Error(), "unexpected character found", t)
 }
 
 func hex(in string) []byte {
@@ -166,7 +166,8 @@ func hex(in string) []byte {
 }
 
 func expect(cur, expected string, t *testing.T) {
+	t.Helper()
 	if cur != expected {
-		t.Fatalf("Expected {%s} got {%s}.", expected, cur)
+		t.Errorf("Expected {%s} got {%s}.", expected, cur)
 	}
 }

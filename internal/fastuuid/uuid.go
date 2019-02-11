@@ -1,3 +1,6 @@
+// This package is copied from github.com/rogpeppe/fastuuid
+// to avoid that external dependency.
+
 // Package fastuuid provides fast UUID generation of 192 bit
 // universally unique identifiers. It does not provide
 // formatting or parsing of the identifiers (it is assumed
