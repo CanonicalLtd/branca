@@ -1,16 +1,29 @@
 // Package branca implements the branca token specification.
+//
+// See https://github.com/tuupola/branca-spec for details.
+//
+// Although the standard specifies that tokens are base62-encoded,
+// this package also provides access to the underlying data
+// bytes so that they can be efficiently included in other
+// byte-oriented formats.
 package branca
 
 import (
-	"bytes"
-	"crypto/rand"
+	"crypto/cipher"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
+	"sync"
 	"time"
 
-	"github.com/eknkc/basex"
 	"golang.org/x/crypto/chacha20poly1305"
+
+	"github.com/CanonicalLtd/branca/internal/basex"
+	"github.com/CanonicalLtd/branca/internal/fastuuid"
+)
+
+var (
+	uuidGenOnce sync.Once
+	uuidGen     = fastuuid.MustNewGenerator()
 )
 
 const (
@@ -21,128 +34,107 @@ const (
 var (
 	errInvalidToken        = errors.New("invalid base62 token")
 	errInvalidTokenVersion = errors.New("invalid token version")
-	errBadKeyLength        = errors.New("bad key length")
-	errExpiredToken        = errors.New("token is expired")
 )
 
+var base62Enc = func() *basex.Encoding {
+	b, err := basex.NewEncoding(base62)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}()
+
+// Base62 returns the base62 encoding of the given data,
+// as specified by the Branca standard.
+//
+// By default, nonce values are generated
+func Base62(data []byte) string {
+	return base62Enc.Encode(data)
+}
+
 // Branca holds a key of exactly 32 bytes. The nonce and timestamp are used for acceptance tests.
+
+// Branca encodes and decodes Branca tokens.
 type Branca struct {
-	Key       string
-	nonce     string
-	ttl       uint32
-	timestamp uint32
+	encrypter cipher.AEAD
 }
 
-// SetTTL sets a Time To Live on the token for valid tokens.
-func (b *Branca) SetTTL(ttl uint32) {
-	b.ttl = ttl
-}
-
-// setTimeStamp sets a timestamp for testing.
-func (b *Branca) setTimeStamp(timestamp uint32) {
-	b.timestamp = timestamp
-}
-
-// setNonce sets a nonce for testing.
-func (b *Branca) setNonce(nonce string) {
-	b.nonce = nonce
-}
-
-// NewBranca creates a *Branca struct.
-func NewBranca(key string) (b *Branca) {
+// New returns a new Codec that encodes and decodes
+// Branca tokens with the given 256-bit key.
+func New(key [32]byte) *Branca {
+	encrypter, err := chacha20poly1305.NewX(key[:])
+	if err != nil {
+		panic(err)
+	}
+	// By doing this lazily, there's probably better chance
+	// that there's more entropy in the random number generator.
+	uuidGenOnce.Do(func() {
+		uuidGen = fastuuid.MustNewGenerator()
+	})
 	return &Branca{
-		Key: key,
+		encrypter: encrypter,
 	}
 }
 
-// EncodeToString encodes the data matching the format:
-// Version (byte) || Timestamp ([4]byte) || Nonce ([24]byte) || Ciphertext ([]byte) || Tag ([16]byte)
-func (b *Branca) EncodeToString(data string) (string, error) {
+// EncodeToRawAtTime is like EncodeToRaw except that the created token
+// will use the given timestamp and nonce.
+//
+// Note that the Base62 function can be used to convert the
+// returned value to a valid Branca token.
+func (b *Branca) EncodeToRawAtTime(payload []byte, nonce [24]byte, t time.Time) []byte {
 	var timestamp uint32
-	var nonce []byte
-	if b.timestamp == 0 {
-		b.timestamp = uint32(time.Now().Unix())
+	if !t.IsZero() {
+		timestamp = uint32(t.Unix())
 	}
-	timestamp = b.timestamp
-
-	if len(b.nonce) == 0 {
-		nonce = make([]byte, 24)
-		if _, err := rand.Read(nonce); err != nil {
-			return "", err
-		}
-	} else {
-		noncebytes, err := hex.DecodeString(b.nonce)
-		if err != nil {
-			return "", errInvalidToken
-		}
-		nonce = noncebytes
-	}
-
-	key := bytes.NewBufferString(b.Key).Bytes()
-	payload := bytes.NewBufferString(data).Bytes()
-
-	timeBuffer := make([]byte, 4)
-	binary.BigEndian.PutUint32(timeBuffer, timestamp)
-	header := append(timeBuffer, nonce...)
-	header = append([]byte{version}, header...)
-
-	xchacha, err := chacha20poly1305.NewX(key)
-	if err != nil {
-		return "", errBadKeyLength
-	}
-
-	ciphertext := xchacha.Seal(nil, nonce, payload, header)
-
-	token := append(header, ciphertext...)
-	base62, err := basex.NewEncoding(base62)
-	if err != nil {
-		return "", err
-	}
-	return base62.Encode(token), nil
+	// version[1], timestamp[4], nonce[24], payload[N], auth[16]
+	header := make([]byte, 1+4+24+len(payload)+16)
+	header[0] = version
+	binary.BigEndian.PutUint32(header[1:5], timestamp)
+	copy(header[5:], nonce[:])
+	return b.encrypter.Seal(header[0:1+4+24], nonce[:], payload, header[0:1+4+24])
 }
 
-// DecodeToString decodes the data.
-func (b *Branca) DecodeToString(data string) (string, error) {
-	if len(data) < 62 {
-		return "", errInvalidToken
+// EncodeToRaw is like Encode except that it returns the underlying
+// encoded token instead of returning it base62-encoded.
+func (b *Branca) EncodeToRaw(payload []byte) []byte {
+	return b.EncodeToRawAtTime(payload, uuidGen.Next(), time.Now())
+}
+
+// Encode encodes the given payload with the key that b was
+// created with.
+func (b *Branca) Encode(payload []byte) string {
+	return Base62(b.EncodeToRaw(payload))
+}
+
+// DecodeRaw is like Decode except that it decodes a Branca token that
+// is not base62 encoded.
+func (b *Branca) DecodeRaw(data []byte) ([]byte, time.Time, error) {
+	// version[1], timestamp[4], nonce[24], payload[N], auth[16]
+	if len(data) < 1+4+24+16 {
+		return nil, time.Time{}, errInvalidToken
 	}
-	base62, err := basex.NewEncoding(base62)
+	header := data[0 : 1+4+24]
+	payload, err := b.encrypter.Open(nil, header[1+4:1+4+24], data[1+4+24:], header)
 	if err != nil {
-		return "", errInvalidToken
+		return nil, time.Time{}, err
 	}
-	token, err := base62.Decode(data)
+	if header[0] != version {
+		return nil, time.Time{}, errInvalidTokenVersion
+	}
+	timestamp := int64(binary.BigEndian.Uint32(data[1 : 1+4]))
+	var t time.Time
+	if timestamp != 0 {
+		t = time.Unix(timestamp, 0)
+	}
+	return payload, t, nil
+}
+
+// Decode decodes a Branca token. It returns the decrypted payload
+// and the associated timestamp of the token.
+func (b *Branca) Decode(token string) ([]byte, time.Time, error) {
+	data, err := base62Enc.Decode(token)
 	if err != nil {
-		return "", errInvalidToken
+		return nil, time.Time{}, errInvalidToken
 	}
-	header := token[0:29]
-	ciphertext := token[29:]
-	tokenversion := header[0]
-	timestamp := binary.BigEndian.Uint32(header[1:5])
-	nonce := header[5:]
-
-	if tokenversion != version {
-		return "", errInvalidTokenVersion
-	}
-
-	key := bytes.NewBufferString(b.Key).Bytes()
-
-	xchacha, err := chacha20poly1305.NewX(key)
-	if err != nil {
-		return "", errBadKeyLength
-	}
-	payload, err := xchacha.Open(nil, nonce, ciphertext, header)
-	if err != nil {
-		return "", err
-	}
-
-	if b.ttl != 0 {
-		future := int64(timestamp + b.ttl)
-		now := time.Now().Unix()
-		if future < now {
-			return "", errExpiredToken
-		}
-	}
-
-	payloadString := bytes.NewBuffer(payload).String()
-	return payloadString, nil
+	return b.DecodeRaw(data)
 }
